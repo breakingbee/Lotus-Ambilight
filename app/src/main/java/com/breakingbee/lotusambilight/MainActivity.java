@@ -124,6 +124,7 @@ public class MainActivity extends Activity {
     private volatile int lastTopR, lastTopG, lastTopB;
     private volatile int lastRightR, lastRightG, lastRightB;
     private volatile int lastBottomR, lastBottomG, lastBottomB;
+    private volatile int lastLeftR, lastLeftG, lastLeftB;
 
     private static final class ColorBucket {
         long red;
