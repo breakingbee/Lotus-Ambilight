@@ -65,6 +65,15 @@ public class MainActivity extends Activity {
     private TextView statusView;
     private TextView selectedView;
     private TextView colorView;
+    private TextView topSampleView;
+    private TextView rightSampleView;
+    private TextView bottomSampleView;
+    private TextView leftSampleView;
+    private Button samplingModeButton;
+    private Button rainbowTestButton;
+    private int samplingMode = 0;
+    private boolean rainbowTestRunning;
+    private int rainbowTestStep;
     private LinearLayout deviceList;
     private BluetoothLeScanner scanner;
     private BluetoothDevice selectedDevice;
@@ -86,6 +95,36 @@ public class MainActivity extends Activity {
     private volatile long lastLedWriteMs;
     private volatile long lastUiUpdateMs;
     private volatile boolean firstCaptureFrameReceived;
+
+    private static final class ColorBucket {
+        long red;
+        long green;
+        long blue;
+        long count;
+
+        void add(int r, int g, int b) {
+            red += r;
+            green += g;
+            blue += b;
+            count++;
+        }
+
+        void add(ColorBucket other) {
+            red += other.red;
+            green += other.green;
+            blue += other.blue;
+            count += other.count;
+        }
+
+        int[] average() {
+            if (count == 0) return new int[]{0, 0, 0};
+            return new int[]{
+                    (int) (red / count),
+                    (int) (green / count),
+                    (int) (blue / count)
+            };
+        }
+    }
 
     private final ServiceConnection captureServiceConnection = new ServiceConnection() {
         @Override
@@ -212,6 +251,35 @@ public class MainActivity extends Activity {
         colorLp.setMargins(0, dp(8), 0, dp(8));
         root.addView(colorView, colorLp);
 
+        LinearLayout sampleRow = new LinearLayout(this);
+        sampleRow.setOrientation(LinearLayout.HORIZONTAL);
+        topSampleView = sampleChip("TOP");
+        rightSampleView = sampleChip("RIGHT");
+        bottomSampleView = sampleChip("BOTTOM");
+        leftSampleView = sampleChip("LEFT");
+        TextView[] samples = {topSampleView, rightSampleView, bottomSampleView, leftSampleView};
+        for (TextView sample : samples) {
+            LinearLayout.LayoutParams sampleLp = new LinearLayout.LayoutParams(
+                    0, dp(54), 1);
+            sampleLp.setMargins(dp(3), dp(2), dp(3), dp(2));
+            sampleRow.addView(sample, sampleLp);
+        }
+        root.addView(sampleRow);
+
+        samplingModeButton = button(samplingModeLabel());
+        samplingModeButton.setOnClickListener(v -> {
+            samplingMode = (samplingMode + 1) % 4;
+            samplingModeButton.setText(samplingModeLabel());
+            setStatus("Sampling mode: " + samplingModeLabel());
+        });
+        addGap(root, 7);
+        root.addView(samplingModeButton);
+
+        rainbowTestButton = button("Rainbow test: start");
+        rainbowTestButton.setOnClickListener(v -> toggleRainbowTest());
+        addGap(root, 5);
+        root.addView(rainbowTestButton);
+
         Button startButton = button("3. Start screen sync");
         startButton.setOnClickListener(v -> requestScreenCapture());
         root.addView(startButton);
@@ -223,12 +291,41 @@ public class MainActivity extends Activity {
 
         addGap(root, 14);
         TextView note = new TextView(this);
-        note.setText("Note: Android will ask you to allow screen capture. Some protected streaming apps may provide a black frame. Keep this app running during this first test.");
+        note.setText("Android will ask you to allow screen capture. Some protected streaming apps may show black frames. The four boxes show sampled screen edges; this controller sends one shared colour to the whole strip. Separate corner colours require addressable LEDs or separate controllers.");
         note.setTextColor(Color.rgb(165, 174, 190));
         note.setTextSize(13);
         root.addView(note);
 
         setContentView(scroll);
+    }
+
+    private TextView sampleChip(String label) {
+        TextView chip = new TextView(this);
+        chip.setText(label + "\\n--");
+        chip.setTextColor(Color.WHITE);
+        chip.setTextSize(11);
+        chip.setGravity(Gravity.CENTER);
+        chip.setBackgroundColor(Color.rgb(35, 42, 54));
+        return chip;
+    }
+
+    private String samplingModeLabel() {
+        switch (samplingMode) {
+            case 1: return "Sampling: PERIMETER • VIVID";
+            case 2: return "Sampling: FULL SCREEN • NATURAL";
+            case 3: return "Sampling: FULL SCREEN • VIVID";
+            default: return "Sampling: PERIMETER • NATURAL";
+        }
+    }
+
+    private void updateSampleChip(TextView chip, String label, int[] rgb) {
+        if (chip == null) return;
+        int color = Color.rgb(rgb[0], rgb[1], rgb[2]);
+        String hex = String.format(Locale.ROOT, "#%02X%02X%02X", rgb[0], rgb[1], rgb[2]);
+        runOnUiThread(() -> {
+            chip.setText(label + "\\n" + hex);
+            chip.setBackgroundColor(color);
+        });
     }
 
     private Button button(String label) {
@@ -451,7 +548,7 @@ public class MainActivity extends Activity {
             return;
         }
         long now = SystemClock.elapsedRealtime();
-        if (!notify && now - lastLedWriteMs < 220) return;
+        if (!notify && now - lastLedWriteMs < 150) return;
         lastLedWriteMs = now;
 
         byte[] frame = new byte[]{
@@ -628,6 +725,42 @@ public class MainActivity extends Activity {
         }, 3000);
     }
 
+    private ColorBucket sampleRegion(ByteBuffer buffer, int rowStride, int pixelStride,
+                                       int width, int height,
+                                       float left, float top, float right, float bottom,
+                                       boolean ignoreLetterboxBlack) {
+        ColorBucket bucket = new ColorBucket();
+        int x0 = Math.max(0, Math.min(width - 1, Math.round(width * left)));
+        int y0 = Math.max(0, Math.min(height - 1, Math.round(height * top)));
+        int x1 = Math.max(x0 + 1, Math.min(width, Math.round(width * right)));
+        int y1 = Math.max(y0 + 1, Math.min(height, Math.round(height * bottom)));
+        int stepX = Math.max(1, (x1 - x0) / 12);
+        int stepY = Math.max(1, (y1 - y0) / 4);
+
+        for (int y = y0 + stepY / 2; y < y1; y += stepY) {
+            for (int x = x0 + stepX / 2; x < x1; x += stepX) {
+                int offset = y * rowStride + x * pixelStride;
+                if (offset + 2 >= buffer.limit()) continue;
+                int r = buffer.get(offset) & 0xFF;
+                int g = buffer.get(offset + 1) & 0xFF;
+                int b = buffer.get(offset + 2) & 0xFF;
+                // Ignore pure black bars when sampling the picture perimeter.
+                if (ignoreLetterboxBlack && r + g + b < 18) continue;
+                bucket.add(r, g, b);
+            }
+        }
+        return bucket;
+    }
+
+    private int[] applyVividness(int[] rgb, boolean vivid) {
+        if (!vivid) return rgb;
+        float[] hsv = new float[3];
+        Color.RGBToHSV(rgb[0], rgb[1], rgb[2], hsv);
+        hsv[1] = Math.min(1.0f, hsv[1] * 1.35f);
+        int color = Color.HSVToColor(hsv);
+        return new int[]{Color.red(color), Color.green(color), Color.blue(color)};
+    }
+
     private void handleScreenFrame(ImageReader reader) {
         Image image = null;
         try {
@@ -641,44 +774,87 @@ public class MainActivity extends Activity {
             int pixelStride = planes[0].getPixelStride();
             int width = image.getWidth();
             int height = image.getHeight();
-            int stepX = Math.max(1, width / 24);
-            int stepY = Math.max(1, height / 14);
-            long red = 0, green = 0, blue = 0, count = 0;
+            if (width <= 0 || height <= 0) return;
 
-            for (int y = stepY / 2; y < height; y += stepY) {
-                for (int x = stepX / 2; x < width; x += stepX) {
+            // Four independent edge zones, inset slightly to avoid the extreme
+            // screen boundary while still following the picture near each side.
+            ColorBucket top = sampleRegion(buffer, rowStride, pixelStride, width, height,
+                    0.06f, 0.06f, 0.94f, 0.20f, true);
+            ColorBucket right = sampleRegion(buffer, rowStride, pixelStride, width, height,
+                    0.80f, 0.20f, 0.94f, 0.80f, true);
+            ColorBucket bottom = sampleRegion(buffer, rowStride, pixelStride, width, height,
+                    0.06f, 0.80f, 0.94f, 0.94f, true);
+            ColorBucket left = sampleRegion(buffer, rowStride, pixelStride, width, height,
+                    0.06f, 0.20f, 0.20f, 0.80f, true);
+
+            int[] topRgb = top.average();
+            int[] rightRgb = right.average();
+            int[] bottomRgb = bottom.average();
+            int[] leftRgb = left.average();
+
+            ColorBucket perimeter = new ColorBucket();
+            perimeter.add(top);
+            perimeter.add(right);
+            perimeter.add(bottom);
+            perimeter.add(left);
+
+            ColorBucket fullScreen = new ColorBucket();
+            int fullStepX = Math.max(1, width / 42);
+            int fullStepY = Math.max(1, height / 24);
+            for (int y = fullStepY / 2; y < height; y += fullStepY) {
+                for (int x = fullStepX / 2; x < width; x += fullStepX) {
                     int offset = y * rowStride + x * pixelStride;
                     if (offset + 2 >= buffer.limit()) continue;
-                    red += buffer.get(offset) & 0xFF;
-                    green += buffer.get(offset + 1) & 0xFF;
-                    blue += buffer.get(offset + 2) & 0xFF;
-                    count++;
+                    fullScreen.add(
+                            buffer.get(offset) & 0xFF,
+                            buffer.get(offset + 1) & 0xFF,
+                            buffer.get(offset + 2) & 0xFF
+                    );
                 }
             }
-            if (count == 0) return;
 
-            int r = (int) (red / count);
-            int g = (int) (green / count);
-            int b = (int) (blue / count);
-            smoothR += (r - smoothR) * 0.24f;
-            smoothG += (g - smoothG) * 0.24f;
-            smoothB += (b - smoothB) * 0.24f;
+            boolean useFullScreen = samplingMode == 2 || samplingMode == 3;
+            boolean vivid = samplingMode == 1 || samplingMode == 3;
+            int[] raw = (useFullScreen ? fullScreen : perimeter).average();
+            int[] output = applyVividness(raw, vivid);
+            int r = output[0];
+            int g = output[1];
+            int b = output[2];
+
+            if (!firstCaptureFrameReceived) {
+                smoothR = r;
+                smoothG = g;
+                smoothB = b;
+            } else {
+                // React faster to a scene cut, but keep small changes smooth.
+                float difference = Math.abs(r - smoothR)
+                        + Math.abs(g - smoothG) + Math.abs(b - smoothB);
+                float alpha = difference > 180 ? 0.52f : 0.32f;
+                smoothR += (r - smoothR) * alpha;
+                smoothG += (g - smoothG) * alpha;
+                smoothB += (b - smoothB) * alpha;
+            }
+
             int sr = clamp(Math.round(smoothR));
             int sg = clamp(Math.round(smoothG));
             int sb = clamp(Math.round(smoothB));
 
             firstCaptureFrameReceived = true;
             long now = SystemClock.elapsedRealtime();
-            if (connected && now - lastLedWriteMs >= 220) {
-                // sendRgb() owns lastLedWriteMs. Do not set it before posting,
-                // otherwise sendRgb() sees a just-written timestamp and rejects
-                // every capture-derived colour as too soon.
+            if (connected && now - lastLedWriteMs >= 150) {
+                // Keep the BLE rate bounded; the sampled colour is updated on
+                // every frame, but only the newest colour is sent to the strip.
                 mainHandler.post(() -> sendRgb(sr, sg, sb, false));
             }
-            if (now - lastUiUpdateMs >= 500) {
+
+            if (now - lastUiUpdateMs >= 300) {
                 lastUiUpdateMs = now;
                 String hex = String.format(Locale.ROOT, "#%02X%02X%02X", sr, sg, sb);
                 int previewColor = Color.rgb(sr, sg, sb);
+                updateSampleChip(topSampleView, "TOP", topRgb);
+                updateSampleChip(rightSampleView, "RIGHT", rightRgb);
+                updateSampleChip(bottomSampleView, "BOTTOM", bottomRgb);
+                updateSampleChip(leftSampleView, "LEFT", leftRgb);
                 mainHandler.post(() -> {
                     if (colorView != null) {
                         colorView.setText(hex);
@@ -686,8 +862,8 @@ public class MainActivity extends Activity {
                     }
                     if (projection != null && firstCaptureFrameReceived) {
                         setStatus(connected
-                                ? "Screen frames arriving • LEDs following " + hex
-                                : "Screen frames arriving • connect the LED strip to sync colours");
+                                ? "Frames arriving • sending " + hex
+                                : "Frames arriving • connect the LED strip to sync");
                     }
                 });
             }
@@ -698,7 +874,51 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void toggleRainbowTest() {
+        if (rainbowTestRunning) {
+            rainbowTestRunning = false;
+            if (rainbowTestButton != null) rainbowTestButton.setText("Rainbow test: start");
+            setStatus("Rainbow test stopped.");
+            return;
+        }
+        if (!connected || gatt == null || rgbCharacteristic == null) {
+            setStatus("Connect to the LED strip before running the rainbow test.");
+            return;
+        }
+        rainbowTestRunning = true;
+        rainbowTestStep = 0;
+        if (rainbowTestButton != null) rainbowTestButton.setText("Rainbow test: stop");
+        setStatus("Rainbow test running: checking the full colour wheel…");
+        advanceRainbowTest();
+    }
+
+    private void advanceRainbowTest() {
+        if (!rainbowTestRunning) return;
+        if (!connected || gatt == null || rgbCharacteristic == null) {
+            rainbowTestRunning = false;
+            if (rainbowTestButton != null) rainbowTestButton.setText("Rainbow test: start");
+            setStatus("Rainbow test stopped because Bluetooth disconnected.");
+            return;
+        }
+        if (rainbowTestStep >= 24) {
+            rainbowTestRunning = false;
+            if (rainbowTestButton != null) rainbowTestButton.setText("Rainbow test: start");
+            setStatus("Rainbow test complete. If every shade appeared, RGB output is working.");
+            return;
+        }
+
+        float hue = (rainbowTestStep * 15.0f) % 360.0f;
+        int color = Color.HSVToColor(new float[]{hue, 1.0f, 1.0f});
+        sendRgb(Color.red(color), Color.green(color), Color.blue(color), false);
+        rainbowTestStep++;
+        mainHandler.postDelayed(this::advanceRainbowTest, 260);
+    }
+
     private void stopScreenCapture() {
+        if (rainbowTestRunning) {
+            rainbowTestRunning = false;
+            if (rainbowTestButton != null) rainbowTestButton.setText("Rainbow test: start");
+        }
         releaseCaptureResources(true);
         setStatus("Screen sync stopped.");
     }
@@ -753,6 +973,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         stopScan();
+        rainbowTestRunning = false;
         releaseCaptureResources(true);
         if (gatt != null) {
             try {
