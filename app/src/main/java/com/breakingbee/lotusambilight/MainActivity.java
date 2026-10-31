@@ -32,6 +32,8 @@ import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
+import android.util.Log;
+import android.widget.Toast;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
@@ -78,6 +80,7 @@ public class MainActivity extends Activity {
     private float smoothB;
     private volatile long lastLedWriteMs;
     private volatile long lastUiUpdateMs;
+    private volatile boolean firstCaptureFrameReceived;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -444,36 +447,67 @@ public class MainActivity extends Activity {
     }
 
     private void requestScreenCapture() {
+        if (projection != null) {
+            setStatus("Screen capture is already active. Press Home and open your video app.");
+            return;
+        }
         MediaProjectionManager manager = (MediaProjectionManager)
                 getSystemService(Context.MEDIA_PROJECTION_SERVICE);
         if (manager == null) {
-            setStatus("Android screen capture is unavailable.");
+            setStatus("Android screen capture is unavailable on this device.");
             return;
         }
-        Intent intent = manager.createScreenCaptureIntent();
-        startActivityForResult(intent, REQUEST_SCREEN_CAPTURE);
+        try {
+            setStatus("Waiting for Android permission… choose \\"Start now\\" on the system prompt.");
+            Toast.makeText(this, "Approve screen capture, then return to Lotus Ambilight.", Toast.LENGTH_LONG).show();
+            Log.i("LotusAmbilight", "Launching MediaProjection permission prompt");
+            startActivityForResult(manager.createScreenCaptureIntent(), REQUEST_SCREEN_CAPTURE);
+        } catch (RuntimeException e) {
+            Log.e("LotusAmbilight", "Could not launch capture permission prompt", e);
+            setStatus("Could not open screen-capture prompt: " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage());
+        }
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode != REQUEST_SCREEN_CAPTURE) return;
+        Log.i("LotusAmbilight", "MediaProjection result received: resultCode=" + resultCode
+                + ", dataPresent=" + (data != null));
         if (resultCode != RESULT_OK || data == null) {
-            setStatus("Screen capture permission was not granted.");
+            setStatus("Screen-capture permission was cancelled or not granted.");
+            Toast.makeText(this, "Screen capture was not allowed.", Toast.LENGTH_LONG).show();
             return;
         }
         MediaProjectionManager manager = (MediaProjectionManager)
                 getSystemService(Context.MEDIA_PROJECTION_SERVICE);
-        if (manager == null) return;
+        if (manager == null) {
+            setStatus("Android MediaProjection service is unavailable.");
+            return;
+        }
         try {
+            setStatus("Permission accepted. Starting screen capture…");
             projection = manager.getMediaProjection(resultCode, data);
+            if (projection == null) {
+                setStatus("Android returned no MediaProjection. Check screen-capture permission.");
+                return;
+            }
             beginScreenCapture();
         } catch (RuntimeException e) {
-            setStatus("Could not start screen capture: " + e.getMessage());
+            Log.e("LotusAmbilight", "Could not initialize MediaProjection", e);
+            releaseCaptureResources(true);
+            setStatus("Could not start screen capture: " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage());
+            Toast.makeText(this, "Screen capture failed. Check Lotus Ambilight status.", Toast.LENGTH_LONG).show();
         }
     }
 
     private void beginScreenCapture() {
+        if (projection == null) {
+            setStatus("Screen capture failed: no MediaProjection token.");
+            return;
+        }
         DisplayMetrics metrics = new DisplayMetrics();
         getWindowManager().getDefaultDisplay().getRealMetrics(metrics);
         if (metrics.widthPixels <= 0 || metrics.heightPixels <= 0) {
@@ -485,8 +519,16 @@ public class MainActivity extends Activity {
         int width = Math.max(2, Math.round(metrics.widthPixels * scale));
         int height = Math.max(2, Math.round(metrics.heightPixels * scale));
 
-        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3);
-        imageReader.setOnImageAvailableListener(this::handleScreenFrame, captureHandler);
+        try {
+            imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3);
+            imageReader.setOnImageAvailableListener(this::handleScreenFrame, captureHandler);
+        } catch (RuntimeException e) {
+            Log.e("LotusAmbilight", "Could not create ImageReader", e);
+            releaseCaptureResources(true);
+            setStatus("Could not create screen reader: " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage());
+            return;
+        }
 
         projection.registerCallback(new MediaProjection.Callback() {
             @Override
@@ -498,25 +540,41 @@ public class MainActivity extends Activity {
             }
         }, mainHandler);
 
-        virtualDisplay = projection.createVirtualDisplay(
-                "LotusAmbilight",
-                width,
-                height,
-                metrics.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                imageReader.getSurface(),
-                null,
-                captureHandler
-        );
+        try {
+            virtualDisplay = projection.createVirtualDisplay(
+                    "LotusAmbilight",
+                    width,
+                    height,
+                    metrics.densityDpi,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    imageReader.getSurface(),
+                    null,
+                    captureHandler
+            );
+        } catch (RuntimeException e) {
+            Log.e("LotusAmbilight", "createVirtualDisplay failed", e);
+            releaseCaptureResources(true);
+            setStatus("Could not start display capture: " + e.getClass().getSimpleName()
+                    + ": " + e.getMessage());
+            return;
+        }
 
         if (virtualDisplay == null) {
-            stopScreenCapture();
-            setStatus("Could not create the screen capture display.");
+            releaseCaptureResources(true);
+            setStatus("Android did not create the screen-capture display.");
             return;
         }
         smoothR = smoothG = smoothB = 0;
         lastLedWriteMs = 0;
-        setStatus("Screen sync is running. Leave this app open in the background and play a video.");
+        lastUiUpdateMs = 0;
+        firstCaptureFrameReceived = false;
+        setStatus("Capture started. Waiting for the first screen frame…");
+        Log.i("LotusAmbilight", "Virtual display started at " + width + "x" + height);
+        mainHandler.postDelayed(() -> {
+            if (projection != null && !firstCaptureFrameReceived) {
+                setStatus("Capture is active, but Android has not delivered frames yet. Check logcat; protected video may be blank.");
+            }
+        }, 3000);
     }
 
     private void handleScreenFrame(ImageReader reader) {
@@ -558,9 +616,12 @@ public class MainActivity extends Activity {
             int sg = clamp(Math.round(smoothG));
             int sb = clamp(Math.round(smoothB));
 
+            firstCaptureFrameReceived = true;
             long now = SystemClock.elapsedRealtime();
             if (connected && now - lastLedWriteMs >= 220) {
-                lastLedWriteMs = now;
+                // sendRgb() owns lastLedWriteMs. Do not set it before posting,
+                // otherwise sendRgb() sees a just-written timestamp and rejects
+                // every capture-derived colour as too soon.
                 mainHandler.post(() -> sendRgb(sr, sg, sb, false));
             }
             if (now - lastUiUpdateMs >= 500) {
@@ -571,6 +632,11 @@ public class MainActivity extends Activity {
                     if (colorView != null) {
                         colorView.setText(hex);
                         colorView.setBackgroundColor(previewColor);
+                    }
+                    if (projection != null && firstCaptureFrameReceived) {
+                        setStatus(connected
+                                ? "Screen frames arriving • LEDs following " + hex
+                                : "Screen frames arriving • connect the LED strip to sync colours");
                     }
                 });
             }
@@ -598,6 +664,7 @@ public class MainActivity extends Activity {
         }
         MediaProjection oldProjection = projection;
         projection = null;
+        firstCaptureFrameReceived = false;
         if (stopProjection && oldProjection != null) {
             oldProjection.stop();
         }
