@@ -71,8 +71,8 @@ public class MainActivity extends Activity {
     private TextView leftSampleView;
     private Button samplingModeButton;
     private Button rainbowTestButton;
-    private int samplingMode = 0;
-    private boolean rainbowTestRunning;
+    private volatile int samplingMode = 0;
+    private volatile boolean rainbowTestRunning;
     private int rainbowTestStep;
     private LinearLayout deviceList;
     private BluetoothLeScanner scanner;
@@ -301,7 +301,7 @@ public class MainActivity extends Activity {
 
     private TextView sampleChip(String label) {
         TextView chip = new TextView(this);
-        chip.setText(label + "\\n--");
+        chip.setText(label + "\n--");
         chip.setTextColor(Color.WHITE);
         chip.setTextSize(11);
         chip.setGravity(Gravity.CENTER);
@@ -323,7 +323,7 @@ public class MainActivity extends Activity {
         int color = Color.rgb(rgb[0], rgb[1], rgb[2]);
         String hex = String.format(Locale.ROOT, "#%02X%02X%02X", rgb[0], rgb[1], rgb[2]);
         runOnUiThread(() -> {
-            chip.setText(label + "\\n" + hex);
+            chip.setText(label + "\n" + hex);
             chip.setBackgroundColor(color);
         });
     }
@@ -841,7 +841,7 @@ public class MainActivity extends Activity {
 
             firstCaptureFrameReceived = true;
             long now = SystemClock.elapsedRealtime();
-            if (connected && now - lastLedWriteMs >= 150) {
+            if (connected && !rainbowTestRunning && now - lastLedWriteMs >= 150) {
                 // Keep the BLE rate bounded; the sampled colour is updated on
                 // every frame, but only the newest colour is sent to the strip.
                 mainHandler.post(() -> sendRgb(sr, sg, sb, false));
@@ -860,7 +860,7 @@ public class MainActivity extends Activity {
                         colorView.setText(hex);
                         colorView.setBackgroundColor(previewColor);
                     }
-                    if (projection != null && firstCaptureFrameReceived) {
+                    if (projection != null && firstCaptureFrameReceived && !rainbowTestRunning) {
                         setStatus(connected
                                 ? "Frames arriving • sending " + hex
                                 : "Frames arriving • connect the LED strip to sync");
