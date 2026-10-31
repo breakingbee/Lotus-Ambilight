@@ -3,6 +3,8 @@ package com.breakingbee.lotusambilight;
 import android.Manifest;
 import android.app.Activity;
 import android.content.Context;
+import android.content.ComponentName;
+import android.content.ServiceConnection;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
@@ -30,6 +32,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.IBinder;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -73,6 +76,8 @@ public class MainActivity extends Activity {
     private HandlerThread captureThread;
     private Handler captureHandler;
     private MediaProjection projection;
+    private ScreenCaptureService captureService;
+    private boolean captureServiceBound;
     private ImageReader imageReader;
     private VirtualDisplay virtualDisplay;
     private float smoothR;
@@ -81,6 +86,41 @@ public class MainActivity extends Activity {
     private volatile long lastLedWriteMs;
     private volatile long lastUiUpdateMs;
     private volatile boolean firstCaptureFrameReceived;
+
+    private final ServiceConnection captureServiceConnection = new ServiceConnection() {
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder binder) {
+            ScreenCaptureService.LocalBinder localBinder =
+                    (ScreenCaptureService.LocalBinder) binder;
+            captureService = localBinder.getService();
+            captureService.setProjectionListener(new ScreenCaptureService.ProjectionListener() {
+                @Override
+                public void onProjectionReady(MediaProjection readyProjection) {
+                    if (isFinishing()) {
+                        if (captureService != null) captureService.stopCapture(true);
+                        return;
+                    }
+                    projection = readyProjection;
+                    beginScreenCapture();
+                }
+
+                @Override
+                public void onProjectionError(String error) {
+                    releaseCaptureResources(false);
+                    setStatus("Could not start screen capture: " + error);
+                    Toast.makeText(MainActivity.this, "Screen capture failed.", Toast.LENGTH_LONG).show();
+                }
+            });
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            captureService = null;
+            captureServiceBound = false;
+            releaseCaptureResources(false);
+            setStatus("Screen-capture service disconnected. Press Start screen sync to retry.");
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -480,26 +520,37 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "Screen capture was not allowed.", Toast.LENGTH_LONG).show();
             return;
         }
-        MediaProjectionManager manager = (MediaProjectionManager)
-                getSystemService(Context.MEDIA_PROJECTION_SERVICE);
-        if (manager == null) {
-            setStatus("Android MediaProjection service is unavailable.");
-            return;
-        }
+        setStatus("Permission accepted. Starting media-projection foreground service…");
+        startProjectionService(resultCode, data);
+    }
+
+    private void startProjectionService(int resultCode, Intent permissionData) {
+        Intent serviceIntent = new Intent(this, ScreenCaptureService.class);
+        serviceIntent.setAction(ScreenCaptureService.ACTION_START);
+        serviceIntent.putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, resultCode);
+        serviceIntent.putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, permissionData);
         try {
-            setStatus("Permission accepted. Starting screen capture…");
-            projection = manager.getMediaProjection(resultCode, data);
-            if (projection == null) {
-                setStatus("Android returned no MediaProjection. Check screen-capture permission.");
-                return;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent);
+            } else {
+                startService(serviceIntent);
             }
-            beginScreenCapture();
+            if (!captureServiceBound) {
+                captureServiceBound = bindService(
+                        new Intent(this, ScreenCaptureService.class),
+                        captureServiceConnection,
+                        Context.BIND_AUTO_CREATE
+                );
+            }
+            if (!captureServiceBound) {
+                setStatus("Could not connect to the screen-capture foreground service.");
+                stopService(serviceIntent);
+            }
         } catch (RuntimeException e) {
-            Log.e("LotusAmbilight", "Could not initialize MediaProjection", e);
-            releaseCaptureResources(true);
-            setStatus("Could not start screen capture: " + e.getClass().getSimpleName()
+            Log.e("LotusAmbilight", "Could not start media-projection foreground service", e);
+            setStatus("Could not start capture service: " + e.getClass().getSimpleName()
                     + ": " + e.getMessage());
-            Toast.makeText(this, "Screen capture failed. Check Lotus Ambilight status.", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Screen capture service could not start.", Toast.LENGTH_LONG).show();
         }
     }
 
@@ -665,8 +716,22 @@ public class MainActivity extends Activity {
         MediaProjection oldProjection = projection;
         projection = null;
         firstCaptureFrameReceived = false;
-        if (stopProjection && oldProjection != null) {
+
+        ScreenCaptureService oldService = captureService;
+        captureService = null;
+        if (oldService != null) {
+            oldService.setProjectionListener(null);
+            oldService.stopCapture(stopProjection);
+        } else if (stopProjection && oldProjection != null) {
             oldProjection.stop();
+        }
+        if (captureServiceBound) {
+            captureServiceBound = false;
+            try {
+                unbindService(captureServiceConnection);
+            } catch (IllegalArgumentException ignored) {
+                // The service was already unbound.
+            }
         }
         if (colorView != null) {
             colorView.setText("Screen sync stopped");
