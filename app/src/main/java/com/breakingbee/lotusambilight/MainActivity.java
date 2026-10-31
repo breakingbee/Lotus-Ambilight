@@ -491,8 +491,9 @@ public class MainActivity extends Activity {
 
     private void exportDiagnosticLog() {
         try {
-            File base = getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS);
-            if (base == null) base = getFilesDir();
+            // Store diagnostics in app-private internal storage. This avoids Android 11+
+            // scoped-storage restrictions when pulling files from /sdcard/Android/data.
+            File base = getFilesDir();
             if (!base.exists() && !base.mkdirs()) {
                 throw new java.io.IOException("Could not create diagnostics folder");
             }
@@ -502,7 +503,8 @@ public class MainActivity extends Activity {
                 writer.write(buildDiagnosticReport());
             }
             diag("DIAGNOSTICS_EXPORTED to app Documents folder");
-            setStatus("Diagnostic log saved. Use ADB pull to copy it to your PC.");
+            setStatus("Diagnostic log saved. Copy it with: adb exec-out run-as "
+                    + getPackageName() + " cat files/LotusAmbilight-diagnostics.txt");
             Toast.makeText(this, "Diagnostic log saved.", Toast.LENGTH_LONG).show();
         } catch (Exception e) {
             diag("DIAGNOSTIC_EXPORT_FAILED " + e.getClass().getSimpleName() + ": " + e.getMessage());
