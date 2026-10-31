@@ -44,6 +44,12 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.SeekBar;
+import android.os.Environment;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStreamWriter;
 
 import java.nio.ByteBuffer;
 import java.util.LinkedHashMap;
@@ -71,6 +77,12 @@ public class MainActivity extends Activity {
     private TextView leftSampleView;
     private Button samplingModeButton;
     private Button rainbowTestButton;
+    private SeekBar[] edgeWeightBars = new SeekBar[4];
+    private TextView[] edgeWeightLabels = new TextView[4];
+    private SeekBar edgeDepthBar;
+    private TextView edgeDepthLabel;
+    private final int[] edgeWeights = {100, 100, 100, 100};
+    private volatile int edgeDepthPercent = 14;
     private volatile int samplingMode = 0;
     private volatile boolean rainbowTestRunning;
     private int rainbowTestStep;
@@ -95,6 +107,23 @@ public class MainActivity extends Activity {
     private volatile long lastLedWriteMs;
     private volatile long lastUiUpdateMs;
     private volatile boolean firstCaptureFrameReceived;
+
+    private final Object diagnosticLock = new Object();
+    private final StringBuilder diagnosticBuffer = new StringBuilder();
+    private volatile long captureFramesTotal;
+    private volatile long captureBlackFrames;
+    private volatile long captureStartMs;
+    private volatile long lastStatsLogMs;
+    private volatile long ledWriteAttempts;
+    private volatile long ledWriteAccepted;
+    private volatile long ledWriteRejected;
+    private volatile int currentCaptureFps;
+    private volatile String lastGattWriteStatus = "not attempted";
+    private volatile String lastCaptureState = "not started";
+    private volatile String lastOutputHex = "none";
+    private volatile int lastTopR, lastTopG, lastTopB;
+    private volatile int lastRightR, lastRightG, lastRightB;
+    private volatile int lastBottomR, lastBottomG, lastBottomB;
 
     private static final class ColorBucket {
         long red;
@@ -140,11 +169,15 @@ public class MainActivity extends Activity {
                         return;
                     }
                     projection = readyProjection;
+                    lastCaptureState = "media_projection_ready";
+                    diag("MEDIA_PROJECTION service returned a projection token");
                     beginScreenCapture();
                 }
 
                 @Override
                 public void onProjectionError(String error) {
+                    lastCaptureState = "service_error";
+                    diag("CAPTURE_SERVICE_ERROR " + error);
                     releaseCaptureResources(false);
                     setStatus("Could not start screen capture: " + error);
                     Toast.makeText(MainActivity.this, "Screen capture failed.", Toast.LENGTH_LONG).show();
@@ -169,6 +202,10 @@ public class MainActivity extends Activity {
         captureThread.start();
         captureHandler = new Handler(captureThread.getLooper());
         buildUi();
+        loadAdvancedSettings();
+        diag("APP_START device=" + Build.MANUFACTURER + " " + Build.MODEL
+                + " android=" + Build.VERSION.RELEASE + " sdk=" + Build.VERSION.SDK_INT
+                + " app=0.1.5");
         setStatus("Ready. Turn on the LED strip, then scan.");
     }
 
@@ -266,6 +303,8 @@ public class MainActivity extends Activity {
         }
         root.addView(sampleRow);
 
+        addAdvancedControls(root);
+
         samplingModeButton = button(samplingModeLabel());
         samplingModeButton.setOnClickListener(v -> {
             samplingMode = (samplingMode + 1) % 4;
@@ -289,14 +328,198 @@ public class MainActivity extends Activity {
         addGap(root, 6);
         root.addView(stopButton);
 
+        Button exportLogButton = button("Save diagnostic log");
+        exportLogButton.setOnClickListener(v -> exportDiagnosticLog());
+        addGap(root, 6);
+        root.addView(exportLogButton);
+
         addGap(root, 14);
         TextView note = new TextView(this);
-        note.setText("Android will ask you to allow screen capture. Some protected streaming apps may show black frames. The four boxes show sampled screen edges; this controller sends one shared colour to the whole strip. Separate corner colours require addressable LEDs or separate controllers.");
+        note.setText("Advanced edge weights control each side's influence on the shared strip colour. Set an edge to 0 to ignore it. Edge depth changes how far into the picture each side samples. This controller sends one colour to the whole strip; it cannot light corners independently.");
         note.setTextColor(Color.rgb(165, 174, 190));
         note.setTextSize(13);
         root.addView(note);
 
         setContentView(scroll);
+    }
+
+    private void addAdvancedControls(LinearLayout root) {
+        addGap(root, 12);
+        root.addView(section("Advanced edge layout"));
+        TextView hint = new TextView(this);
+        hint.setText("Adjust each side's influence. Set a side to 0% to ignore it.");
+        hint.setTextColor(Color.rgb(165, 174, 190));
+        hint.setTextSize(12);
+        root.addView(hint);
+
+        String[] labels = {"TOP", "RIGHT", "BOTTOM", "LEFT"};
+        for (int i = 0; i < labels.length; i++) {
+            final int index = i;
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+
+            TextView label = new TextView(this);
+            label.setText(labels[i] + "  " + edgeWeights[i] + "%");
+            label.setTextColor(Color.WHITE);
+            label.setTextSize(13);
+            edgeWeightLabels[i] = label;
+            row.addView(label, new LinearLayout.LayoutParams(dp(105), dp(42)));
+
+            SeekBar bar = new SeekBar(this);
+            bar.setMax(100);
+            bar.setProgress(edgeWeights[i]);
+            bar.setContentDescription(labels[i] + " edge weight");
+            bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                    edgeWeights[index] = progress;
+                    if (edgeWeightLabels[index] != null) {
+                        edgeWeightLabels[index].setText(labels[index] + "  " + progress + "%");
+                    }
+                    if (fromUser) {
+                        getSharedPreferences("ambilight_settings", MODE_PRIVATE)
+                                .edit().putInt("edge_" + index, progress).apply();
+                    }
+                }
+                @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+                @Override public void onStopTrackingTouch(SeekBar seekBar) {
+                    diag("SETTING edge_" + labels[index] + "_weight=" + edgeWeights[index]);
+                }
+            });
+            edgeWeightBars[i] = bar;
+            row.addView(bar, new LinearLayout.LayoutParams(0, dp(42), 1));
+            root.addView(row);
+        }
+
+        LinearLayout depthRow = new LinearLayout(this);
+        depthRow.setOrientation(LinearLayout.HORIZONTAL);
+        depthRow.setGravity(Gravity.CENTER_VERTICAL);
+        edgeDepthLabel = new TextView(this);
+        edgeDepthLabel.setText("Edge depth  " + edgeDepthPercent + "%");
+        edgeDepthLabel.setTextColor(Color.WHITE);
+        edgeDepthLabel.setTextSize(13);
+        depthRow.addView(edgeDepthLabel, new LinearLayout.LayoutParams(dp(125), dp(42)));
+
+        edgeDepthBar = new SeekBar(this);
+        edgeDepthBar.setMax(25);
+        edgeDepthBar.setProgress(edgeDepthPercent - 5);
+        edgeDepthBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                edgeDepthPercent = progress + 5;
+                if (edgeDepthLabel != null) edgeDepthLabel.setText("Edge depth  " + edgeDepthPercent + "%");
+                if (fromUser) {
+                    getSharedPreferences("ambilight_settings", MODE_PRIVATE)
+                            .edit().putInt("edge_depth", edgeDepthPercent).apply();
+                }
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {
+                diag("SETTING edge_depth=" + edgeDepthPercent);
+            }
+        });
+        depthRow.addView(edgeDepthBar, new LinearLayout.LayoutParams(0, dp(42), 1));
+        root.addView(depthRow);
+    }
+
+    private void loadAdvancedSettings() {
+        android.content.SharedPreferences prefs =
+                getSharedPreferences("ambilight_settings", MODE_PRIVATE);
+        String[] names = {"TOP", "RIGHT", "BOTTOM", "LEFT"};
+        for (int i = 0; i < edgeWeights.length; i++) {
+            edgeWeights[i] = Math.max(0, Math.min(100, prefs.getInt("edge_" + i, 100)));
+            if (edgeWeightBars[i] != null) edgeWeightBars[i].setProgress(edgeWeights[i]);
+            if (edgeWeightLabels[i] != null) {
+                edgeWeightLabels[i].setText(names[i] + "  " + edgeWeights[i] + "%");
+            }
+        }
+        edgeDepthPercent = Math.max(5, Math.min(30, prefs.getInt("edge_depth", 14)));
+        if (edgeDepthBar != null) edgeDepthBar.setProgress(edgeDepthPercent - 5);
+        if (edgeDepthLabel != null) edgeDepthLabel.setText("Edge depth  " + edgeDepthPercent + "%");
+    }
+
+    private void diag(String message) {
+        String line = "[" + SystemClock.elapsedRealtime() + "ms] " + message + "\n";
+        synchronized (diagnosticLock) {
+            diagnosticBuffer.append(line);
+            if (diagnosticBuffer.length() > 120000) {
+                diagnosticBuffer.delete(0, diagnosticBuffer.length() - 90000);
+            }
+        }
+        Log.i("LotusAmbilight", message);
+    }
+
+    private String rgbHex(int[] rgb) {
+        return String.format(Locale.ROOT, "#%02X%02X%02X", rgb[0], rgb[1], rgb[2]);
+    }
+
+    private String buildDiagnosticReport() {
+        StringBuilder report = new StringBuilder();
+        report.append("LOTUS AMBILIGHT DIAGNOSTICS\n");
+        report.append("App version: 0.1.5-debug\n");
+        report.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL)
+                .append(" / Android ").append(Build.VERSION.RELEASE)
+                .append(" (SDK ").append(Build.VERSION.SDK_INT).append(")\n");
+        report.append("Capture state: ").append(lastCaptureState).append("\n");
+        report.append("Frames received: ").append(captureFramesTotal).append("\n");
+        report.append("Average capture FPS: ").append(currentCaptureFps).append("\n");
+        report.append("Near-black sampled frames: ").append(captureBlackFrames).append("\n");
+        report.append("LED connected: ").append(connected).append("\n");
+        report.append("LED writes attempted/accepted/rejected: ")
+                .append(ledWriteAttempts).append("/")
+                .append(ledWriteAccepted).append("/")
+                .append(ledWriteRejected).append("\n");
+        report.append("Last BLE write status: ").append(lastGattWriteStatus).append("\n");
+        report.append("Last RGB output: ").append(lastOutputHex).append("\n");
+        report.append("Sampling mode: ").append(samplingModeLabel()).append("\n");
+        report.append("Edge weights TOP/RIGHT/BOTTOM/LEFT: ")
+                .append(edgeWeights[0]).append("/")
+                .append(edgeWeights[1]).append("/")
+                .append(edgeWeights[2]).append("/")
+                .append(edgeWeights[3]).append("%\n");
+        report.append("Edge depth: ").append(edgeDepthPercent).append("%\n");
+        report.append("Last edge RGB TOP=").append(lastTopR).append(",").append(lastTopG).append(",").append(lastTopB)
+                .append(" RIGHT=").append(lastRightR).append(",").append(lastRightG).append(",").append(lastRightB)
+                .append(" BOTTOM=").append(lastBottomR).append(",").append(lastBottomG).append(",").append(lastBottomB)
+                .append(" LEFT=").append(lastLeftR).append(",").append(lastLeftG).append(",").append(lastLeftB).append("\n");
+        report.append("\n--- EVENT LOG ---\n");
+        synchronized (diagnosticLock) {
+            report.append(diagnosticBuffer);
+        }
+        return report.toString();
+    }
+
+    private void exportDiagnosticLog() {
+        try {
+            File base = getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS);
+            if (base == null) base = getFilesDir();
+            if (!base.exists() && !base.mkdirs()) {
+                throw new java.io.IOException("Could not create diagnostics folder");
+            }
+            File output = new File(base, "LotusAmbilight-diagnostics.txt");
+            try (OutputStreamWriter writer = new OutputStreamWriter(
+                    new FileOutputStream(output, false), "UTF-8")) {
+                writer.write(buildDiagnosticReport());
+            }
+            diag("DIAGNOSTICS_EXPORTED to app Documents folder");
+            setStatus("Diagnostic log saved. Use ADB pull to copy it to your PC.");
+            Toast.makeText(this, "Diagnostic log saved.", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            diag("DIAGNOSTIC_EXPORT_FAILED " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            setStatus("Could not save diagnostic log: " + e.getMessage());
+        }
+    }
+
+    private int[] weightedEdgeColor(int[][] rgb, int[] weights, int[] counts) {
+        long r = 0, g = 0, b = 0, total = 0;
+        for (int i = 0; i < 4; i++) {
+            int weight = counts[i] > 0 ? Math.max(0, weights[i]) : 0;
+            r += (long) rgb[i][0] * weight;
+            g += (long) rgb[i][1] * weight;
+            b += (long) rgb[i][2] * weight;
+            total += weight;
+        }
+        if (total == 0) return new int[]{0, 0, 0};
+        return new int[]{(int)(r / total), (int)(g / total), (int)(b / total)};
     }
 
     private TextView sampleChip(String label) {
@@ -390,6 +613,7 @@ public class MainActivity extends Activity {
         BluetoothManager manager = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
         BluetoothAdapter adapter = manager == null ? null : manager.getAdapter();
         if (adapter == null || !adapter.isEnabled()) {
+            diag("BLE_SCAN unavailable_or_disabled");
             setStatus("Bluetooth is unavailable or switched off. Enable Bluetooth and retry.");
             return;
         }
@@ -406,6 +630,7 @@ public class MainActivity extends Activity {
         try {
             scanner.startScan(scanCallback);
             scanning = true;
+            diag("BLE_SCAN started");
             setStatus("Scanning for nearby Lotus Lantern / BLEDOM lights for 12 seconds…");
             mainHandler.postDelayed(this::stopScan, 12000);
         } catch (SecurityException e) {
@@ -451,6 +676,7 @@ public class MainActivity extends Activity {
 
     private void addDiscoveredDevice(BluetoothDevice device, String name, String address) {
         if (discoveredDevices.containsKey(address)) return;
+        diag("BLE_DEVICE_FOUND name=" + name);
         discoveredDevices.put(address, device);
         if (selectedDevice == null) {
             selectedDevice = device;
@@ -496,7 +722,8 @@ public class MainActivity extends Activity {
             }
             connected = false;
             rgbCharacteristic = null;
-            setStatus("Connecting to " + selectedDevice.getAddress() + "…");
+            diag("BLE_CONNECT started; device MAC omitted from diagnostics");
+            setStatus("Connecting to selected LED controller…");
             gatt = selectedDevice.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
         } catch (SecurityException e) {
             setStatus("Bluetooth connect permission was denied: " + e.getMessage());
@@ -508,6 +735,7 @@ public class MainActivity extends Activity {
         public void onConnectionStateChange(BluetoothGatt bluetoothGatt, int status, int newState) {
             if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
                 connected = true;
+                diag("BLE_CONNECTED status=" + status);
                 setStatus("Connected. Discovering Lotus Lantern service…");
                 try {
                     bluetoothGatt.discoverServices();
@@ -517,7 +745,17 @@ public class MainActivity extends Activity {
             } else {
                 connected = false;
                 rgbCharacteristic = null;
+                diag("BLE_DISCONNECTED status=" + status + " newState=" + newState);
                 setStatus("Bluetooth disconnected (status " + status + "). Press Connect to retry.");
+            }
+        }
+
+        @Override
+        public void onCharacteristicWrite(BluetoothGatt bluetoothGatt,
+                                          BluetoothGattCharacteristic characteristic, int status) {
+            lastGattWriteStatus = "callback status=" + status;
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                diag("BLE_WRITE_CALLBACK_FAILED status=" + status);
             }
         }
 
@@ -538,6 +776,7 @@ public class MainActivity extends Activity {
                 return;
             }
             connected = true;
+            diag("BLE_SERVICES_READY FFF0/FFF3 properties=" + rgbCharacteristic.getProperties());
             setStatus("Lotus Lantern connected: FFF0 / FFF3 ready. Try the colour buttons.");
         }
     };
@@ -550,6 +789,8 @@ public class MainActivity extends Activity {
         long now = SystemClock.elapsedRealtime();
         if (!notify && now - lastLedWriteMs < 150) return;
         lastLedWriteMs = now;
+        ledWriteAttempts++;
+        lastOutputHex = String.format(Locale.ROOT, "#%02X%02X%02X", clamp(r), clamp(g), clamp(b));
 
         byte[] frame = new byte[]{
                 (byte) 0x7E, 0x07, 0x05, 0x03,
@@ -570,11 +811,24 @@ public class MainActivity extends Activity {
                 rgbCharacteristic.setValue(frame);
                 accepted = gatt.writeCharacteristic(rgbCharacteristic);
             }
+            if (accepted) {
+                ledWriteAccepted++;
+                lastGattWriteStatus = "accepted by Android BLE stack";
+            } else {
+                ledWriteRejected++;
+                lastGattWriteStatus = "rejected by Android BLE stack";
+            }
+            if (notify || ledWriteAttempts % 20 == 0) {
+                diag("BLE_WRITE " + lastOutputHex + " accepted=" + accepted
+                        + " attempts=" + ledWriteAttempts);
+            }
             if (notify) {
-                String hex = String.format(Locale.ROOT, "#%02X%02X%02X", clamp(r), clamp(g), clamp(b));
-                setStatus(accepted ? "Sent " + hex + " to Lotus Lantern." : "Bluetooth rejected the colour write.");
+                setStatus(accepted ? "Sent " + lastOutputHex + " to Lotus Lantern." : "Bluetooth rejected the colour write.");
             }
         } catch (SecurityException e) {
+            ledWriteRejected++;
+            lastGattWriteStatus = "SecurityException: " + e.getMessage();
+            diag("BLE_WRITE_EXCEPTION " + e.getClass().getSimpleName() + ": " + e.getMessage());
             setStatus("Bluetooth write permission was denied: " + e.getMessage());
         }
     }
@@ -617,6 +871,8 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "Screen capture was not allowed.", Toast.LENGTH_LONG).show();
             return;
         }
+        diag("MEDIA_PROJECTION_PERMISSION granted");
+        lastCaptureState = "permission_granted_starting_service";
         setStatus("Permission accepted. Starting media-projection foreground service…");
         startProjectionService(resultCode, data);
     }
@@ -682,6 +938,8 @@ public class MainActivity extends Activity {
             @Override
             public void onStop() {
                 runOnUiThread(() -> {
+                    lastCaptureState = "stopped_by_android";
+                    diag("MEDIA_PROJECTION onStop callback");
                     releaseCaptureResources(false);
                     setStatus("Android stopped screen capture.");
                 });
@@ -713,6 +971,13 @@ public class MainActivity extends Activity {
             return;
         }
         smoothR = smoothG = smoothB = 0;
+        captureFramesTotal = 0;
+        captureBlackFrames = 0;
+        captureStartMs = SystemClock.elapsedRealtime();
+        lastStatsLogMs = captureStartMs;
+        currentCaptureFps = 0;
+        lastCaptureState = "capturing_" + width + "x" + height;
+        diag("CAPTURE_STARTED MediaProjection virtual_display=" + width + "x" + height);
         lastLedWriteMs = 0;
         lastUiUpdateMs = 0;
         firstCaptureFrameReceived = false;
@@ -720,7 +985,9 @@ public class MainActivity extends Activity {
         Log.i("LotusAmbilight", "Virtual display started at " + width + "x" + height);
         mainHandler.postDelayed(() -> {
             if (projection != null && !firstCaptureFrameReceived) {
-                setStatus("Capture is active, but Android has not delivered frames yet. Check logcat; protected video may be blank.");
+                lastCaptureState = "no_frames_after_3s";
+                diag("CAPTURE_WARNING no image frames delivered within 3 seconds");
+                setStatus("Capture is active, but Android has not delivered frames yet. Protected video may be blank.");
             }
         }, 3000);
     }
@@ -778,25 +1045,28 @@ public class MainActivity extends Activity {
 
             // Four independent edge zones, inset slightly to avoid the extreme
             // screen boundary while still following the picture near each side.
+            float depth = edgeDepthPercent / 100.0f;
             ColorBucket top = sampleRegion(buffer, rowStride, pixelStride, width, height,
-                    0.06f, 0.06f, 0.94f, 0.20f, true);
+                    0.02f, 0.02f, 0.98f, depth, true);
             ColorBucket right = sampleRegion(buffer, rowStride, pixelStride, width, height,
-                    0.80f, 0.20f, 0.94f, 0.80f, true);
+                    1.0f - depth, depth, 0.98f, 1.0f - depth, true);
             ColorBucket bottom = sampleRegion(buffer, rowStride, pixelStride, width, height,
-                    0.06f, 0.80f, 0.94f, 0.94f, true);
+                    0.02f, 1.0f - depth, 0.98f, 0.98f, true);
             ColorBucket left = sampleRegion(buffer, rowStride, pixelStride, width, height,
-                    0.06f, 0.20f, 0.20f, 0.80f, true);
+                    0.02f, depth, depth, 1.0f - depth, true);
 
             int[] topRgb = top.average();
             int[] rightRgb = right.average();
             int[] bottomRgb = bottom.average();
             int[] leftRgb = left.average();
 
-            ColorBucket perimeter = new ColorBucket();
-            perimeter.add(top);
-            perimeter.add(right);
-            perimeter.add(bottom);
-            perimeter.add(left);
+            lastTopR = topRgb[0]; lastTopG = topRgb[1]; lastTopB = topRgb[2];
+            lastRightR = rightRgb[0]; lastRightG = rightRgb[1]; lastRightB = rightRgb[2];
+            lastBottomR = bottomRgb[0]; lastBottomG = bottomRgb[1]; lastBottomB = bottomRgb[2];
+            lastLeftR = leftRgb[0]; lastLeftG = leftRgb[1]; lastLeftB = leftRgb[2];
+            int[][] edgeRgb = {topRgb, rightRgb, bottomRgb, leftRgb};
+            int[] edgeCounts = {(int) top.count, (int) right.count, (int) bottom.count, (int) left.count};
+            int[] effectiveWeights = edgeWeights.clone();
 
             ColorBucket fullScreen = new ColorBucket();
             int fullStepX = Math.max(1, width / 42);
@@ -815,7 +1085,9 @@ public class MainActivity extends Activity {
 
             boolean useFullScreen = samplingMode == 2 || samplingMode == 3;
             boolean vivid = samplingMode == 1 || samplingMode == 3;
-            int[] raw = (useFullScreen ? fullScreen : perimeter).average();
+            int[] raw = useFullScreen
+                    ? fullScreen.average()
+                    : weightedEdgeColor(edgeRgb, effectiveWeights, edgeCounts);
             int[] output = applyVividness(raw, vivid);
             int r = output[0];
             int g = output[1];
@@ -840,7 +1112,26 @@ public class MainActivity extends Activity {
             int sb = clamp(Math.round(smoothB));
 
             firstCaptureFrameReceived = true;
+            captureFramesTotal++;
+            if (r + g + b < 18) captureBlackFrames++;
             long now = SystemClock.elapsedRealtime();
+            if (now - lastStatsLogMs >= 5000) {
+                currentCaptureFps = (int) Math.round(
+                        (captureFramesTotal * 1000.0) / Math.max(1, now - captureStartMs));
+                lastStatsLogMs = now;
+                diag("CAPTURE_STATS frames=" + captureFramesTotal
+                        + " avg_fps=" + currentCaptureFps
+                        + " near_black=" + captureBlackFrames
+                        + " output=" + String.format(Locale.ROOT, "#%02X%02X%02X", sr, sg, sb)
+                        + " top=" + rgbHex(topRgb)
+                        + " right=" + rgbHex(rightRgb)
+                        + " bottom=" + rgbHex(bottomRgb)
+                        + " left=" + rgbHex(leftRgb)
+                        + " mode=" + samplingModeLabel()
+                        + " depth=" + edgeDepthPercent
+                        + " weights=" + edgeWeights[0] + "/" + edgeWeights[1] + "/"
+                        + edgeWeights[2] + "/" + edgeWeights[3]);
+            }
             if (connected && !rainbowTestRunning && now - lastLedWriteMs >= 150) {
                 // Keep the BLE rate bounded; the sampled colour is updated on
                 // every frame, but only the newest colour is sent to the strip.
@@ -920,6 +1211,8 @@ public class MainActivity extends Activity {
             if (rainbowTestButton != null) rainbowTestButton.setText("Rainbow test: start");
         }
         releaseCaptureResources(true);
+        lastCaptureState = "stopped";
+        diag("CAPTURE_STOPPED frames=" + captureFramesTotal + " near_black=" + captureBlackFrames);
         setStatus("Screen sync stopped.");
     }
 
