@@ -458,7 +458,7 @@ public class MainActivity extends Activity {
             return;
         }
         try {
-            setStatus("Waiting for Android permission… choose \\"Start now\\" on the system prompt.");
+            setStatus("Waiting for Android permission… choose \"Start now\" on the system prompt.");
             Toast.makeText(this, "Approve screen capture, then return to Lotus Ambilight.", Toast.LENGTH_LONG).show();
             Log.i("LotusAmbilight", "Launching MediaProjection permission prompt");
             startActivityForResult(manager.createScreenCaptureIntent(), REQUEST_SCREEN_CAPTURE);
